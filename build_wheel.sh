@@ -49,7 +49,7 @@ uv pip install "torch==$TORCH_VERSION" numpy psutil
 
 # Install build dependencies
 echo "Installing build dependencies..."
-uv pip install setuptools>=69.5.1 wheel ninja
+uv pip install setuptools wheel ninja
 
 # Build the wheel
 echo "Building wheel..."

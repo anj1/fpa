@@ -2,13 +2,13 @@ from functools import wraps
 import inspect
 import torch
 from flash_attn import flash_attn_func
-from power_attention.power_full import power_full, power_full_vidrial
-from power_attention.create_inputs import create_inputs as create_inputs_power
-from power_attention._expansion import expand as triton_expand, create_inputs as create_inputs_expansion
-from power_attention._attention import attention_triton, attention_cuda, create_inputs_cuda as create_inputs_attention_cuda, create_inputs as create_inputs_attention
-from power_attention._update_state import update_state_triton, update_state_vidrial, create_inputs as create_inputs_update_state
-from power_attention._query_state import query_state_triton, query_state_vidrial, create_inputs as create_inputs_query_state
-from power_attention._discumsum import discumsum, create_inputs as create_inputs_discumsum
+from fp_attention.power_full import power_full, power_full_vidrial
+from fp_attention.create_inputs import create_inputs as create_inputs_power
+from fp_attention._expansion import expand as triton_expand, create_inputs as create_inputs_expansion
+from fp_attention._power_attention import attention_triton, attention_cuda, create_inputs_cuda as create_inputs_attention_cuda, create_inputs as create_inputs_attention
+from fp_attention._update_state import update_state_triton, update_state_vidrial, create_inputs as create_inputs_update_state
+from fp_attention._query_state import query_state_triton, query_state_vidrial, create_inputs as create_inputs_query_state
+from fp_attention._discumsum import discumsum, create_inputs as create_inputs_discumsum
 from .flash import create_inputs as create_inputs_flash
 from .sdpa import create_inputs as create_inputs_sdpa
 

@@ -17,7 +17,7 @@ from collections import defaultdict
 
 from .db import KVDB
 from .benchmarks.runs import *  # noqa
-from power_attention import default_D
+from fp_attention import default_D
 from vidrial.mosaic.utils.gpu import get_cuda_device_basic_props
 
 benchmark_db = KVDB(os.path.expanduser('~/.power-attention-benchmark.db'))

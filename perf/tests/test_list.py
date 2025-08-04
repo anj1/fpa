@@ -28,7 +28,7 @@ def id_fn(fns_params):
 
 ## attention ##
 
-from power_attention._attention import (
+from fp_attention._power_attention import (
     create_inputs as attention_create_inputs,
     input_properties as attention_input_properties,
     output_properties as attention_output_properties,
@@ -67,7 +67,7 @@ ATTENTION_TEST_CASES = fn_set_and_param_range_to_test_cases(attention_fn_sets, a
 
 
 ## update_state ##
-from power_attention._update_state import (
+from fp_attention._update_state import (
     create_inputs as update_state_create_inputs,
     input_properties as update_state_input_properties,
     output_properties as update_state_output_properties,
@@ -123,7 +123,7 @@ update_state_vidrial_param_ranges = {
 
 
 ## discumsum ##
-from power_attention._discumsum import (
+from fp_attention._discumsum import (
     create_inputs as discumsum_create_inputs,
     input_properties as discumsum_input_properties,
     output_properties as discumsum_output_properties,
@@ -155,7 +155,7 @@ DISCUMSUM_TEST_CASES = fn_set_and_param_range_to_test_cases(discumsum_fn_sets, d
 
 
 ## query_state ##
-from power_attention._query_state import (
+from fp_attention._query_state import (
     create_inputs as query_state_create_inputs,
     input_properties as query_state_input_properties,
     output_properties as query_state_output_properties,
@@ -213,14 +213,14 @@ query_state_vidrial_param_ranges = {
 
 ## power full
 
-from power_attention import (
+from fp_attention import (
     create_inputs as power_full_create_inputs,
     input_properties as power_full_input_properties,
     output_properties as power_full_output_properties,
 )
-from power_attention.reference import power_full as power_full_reference
-from power_attention.vidrial_reference import power_full as power_full_vidrial_reference
-from power_attention.triton import power_full
+from fp_attention.reference import power_full as power_full_reference
+from fp_attention.vidrial_reference import power_full as power_full_vidrial_reference
+from fp_attention.triton import power_full
 power_full_input_output = {'create_inputs': power_full_create_inputs, 'input_properties': power_full_input_properties, 'output_properties': power_full_output_properties}
 power_full_fn_sets = [
     {'name': 'power_full_reference', 'extends': 'power_full', 'impl': 'reference',

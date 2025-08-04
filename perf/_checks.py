@@ -6,7 +6,7 @@ from perf._utils import clone_grads, clear_grads, same_device
 from perf._inspect import inspect_diff_details
 from perf._precision import get_violation_pct
 
-from power_attention._utils import diff
+from fp_attention._utils import diff
 
 # General checks
 

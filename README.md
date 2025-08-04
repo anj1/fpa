@@ -1,40 +1,41 @@
-# Power Attention
-[![Build](https://github.com/m-a-n-i-f-e-s-t/power-attention/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/m-a-n-i-f-e-s-t/power-attention/actions/workflows/build-and-test.yml)
+# Factorized Polynomial Attention (FPA)
 
-This repository contains a PyTorch layer implementing symmetric power attention, a linear-cost variant of attention whose state size can be controlled
-independently of context length and parameter count.
+[](https://github.com/anj1/fpa/actions/workflows/build-and-test.yml)
 
-For details on the approach, see our paper: [Scaling Context Requires Rethinking Attention](http://arxiv.org/abs/2507.04239)
+[cite\_start]This repository contains a PyTorch layer implementing Factorized Polynomial Attention (FPA)[cite: 725, 747]. [cite\_start]FPA is a linear-cost attention mechanism that generalizes Power Attention and offers fine-grained control over its state size[cite: 725, 728]. [cite\_start]The architecture expresses a degree-n polynomial kernel as a product of n inner products in lower-dimensional projected spaces, allowing the state size to be adjusted by tuning the projection dimensions[cite: 726, 727].
 
-Documentation: [https://m-a-n-i-f-e-s-t.github.io/power-attention/](https://m-a-n-i-f-e-s-t.github.io/power-attention/)
-
-
+For details on the approach, see our post: [https://anj1.github.io/research/posts/fpattention/](https://anj1.github.io/research/posts/fpattention/)
 
 ### Features
 
-- Efficient chunked algorithm for linear scaling with sequence length (O(t) cost vs O(t²) for standard attention)
-- Support for gated attention and rotary embeddings
-- CUDA kernels optimized for A100
-- FP16 and BF16 support
-
+  - [cite\_start]Exact, deterministic polynomial kernel without Monte-Carlo variance[cite: 725, 737].
+  - [cite\_start]Linear scaling with sequence length using an efficient chunked algorithm[cite: 728, 879].
+  - [cite\_start]Fine-grained, continuous control over state size by adjusting projection dimensions[cite: 725, 727].
+  - [cite\_start]Hardware-friendly implementation with a dual formulation for parallel and recurrent processing[cite: 728, 871, 879].
+  - [cite\_start]Support for various special cases and sub-families, including Linear Attention and Power Attention[cite: 728, 754, 755, 855].
 
 ## Installation
 
 ### From PyPI (Recommended)
+
 ```bash
-pip install power-attention
+pip install fpa
 ```
 
 ### From Source
+
 Requirements:
-- Python 3.11 or 3.12 (3.13 depends on the upcoming [Triton 3.2 release](https://github.com/triton-lang/triton/issues/5215))
-- CUDA Toolkit 12.4
-- GCC/G++ with C++17 support
-- Linux (Windows/MacOS not supported)
+
+  - Python 3.11 or 3.12 (3.13 depends on the upcoming [Triton 3.2 release](https://github.com/triton-lang/triton/issues/5215))
+  - CUDA Toolkit 12.4
+  - GCC/G++ with C++17 support
+  - Linux (Windows/MacOS not supported)
+
+<!-- end list -->
 
 ```bash
-git clone https://github.com/manifest-ai/power-attention.git
-cd power-attention
+git clone https://github.com/anj1/fpa.git
+cd fpa
 pip install -e .
 ```
 
@@ -42,11 +43,11 @@ All other dependencies (PyTorch, Ninja build system, etc.) will be automatically
 
 ## Usage
 
-The main entry point is the `power_full` function, which implements symmetric power attention. Here's a basic example:
+The main entry point is the `fpa_full` function, which implements Factorized Polynomial Attention. Here's a basic example:
 
 ```python
 import torch
-from power_attention.power_full import power_full
+from fpa.fpa_full import fpa_full
 
 # Create input tensors
 batch_size = 2
@@ -64,10 +65,11 @@ log_G = torch.nn.functional.logsigmoid(
 )
 
 # Compute attention
-output = power_full(
+output = fpa_full(
     Q=Q, K=K, V=V, 
     log_G=log_G,          # Optional gating tensor
-    deg=2,                # Power parameter p
+    degree=2,             # Kernel degree (n)
+    branch_dims=[32, 32], # Dimensions of the projected spaces {d_l}. Product must equal head_dim.
     chunk_size=128,       # Size of chunks for processing long sequences
 )
 ```
@@ -75,10 +77,10 @@ output = power_full(
 ### Integration with Transformer Models
 
 The package includes a drop-in replacement for standard attention in transformer models.
-See `train/model.py` for a complete example of using power attention in a GPT-style model:
+See `train/model.py` for a complete example of using FPA in a GPT-style model:
 
 ```python
-from power_attention.power_full import power_full
+from fpa.fpa_full import fpa_full
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -88,11 +90,12 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         # ... projection code ...
         
-        # Use power attention instead of standard attention
-        y = power_full(
+        # Use FPA instead of standard attention
+        y = fpa_full(
             Q=q, K=k, V=v, 
             log_G=log_g,
-            deg=self.degree,
+            degree=self.degree,
+            branch_dims=self.branch_dims,
             chunk_size=self.chunk_size
         )
         
@@ -132,7 +135,7 @@ python -m perf.benchmark bwd          // Backward pass
 python -m perf.benchmark fwd+bwd      // Forward + backward pass
 ```
 
-See [benchmark](https://github.com/m-a-n-i-f-e-s-t/power-attention/tree/main/perf/README.md) for details.
+See [benchmark](https://www.google.com/search?q=https://github.com/anj1/fpa/tree/main/perf/README.md) for details.
 
 ### Documentation
 
@@ -144,6 +147,7 @@ pip install mkdocs mkdocs-material
 ```
 
 To update it publicly, run:
+
 ```bash
 mkdocs gh-deploy
 ```
@@ -159,21 +163,24 @@ python prepare_owt.py
 # Single GPU training
 python train.py \
   --batch_size=32 \
-  --attention_kernel=power \
+  --attention_kernel=fpa \
   --degree=2 \
+  --branch_dims="[32, 32]" \
   --chunk_size=128 \
   --disable_gating=False
 
 # Multi-GPU training with DDP (example with 4 GPUs)
 torchrun --standalone --nproc_per_node=4 train.py \
   --batch_size=32 \
-  --attention_kernel=power \
+  --attention_kernel=fpa \
   --degree=2 \
+  --branch_dims="[32, 32]" \
   --chunk_size=128 \
   --disable_gating=False
 ```
 
 For distributed training across multiple nodes:
+
 ```bash
 # On the first (master) node with IP 123.456.123.456:
 torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
@@ -186,63 +193,61 @@ Note: If your cluster does not have Infiniband interconnect, prepend `NCCL_IB_DI
 
 ## Contributing
 
-We welcome contributions! Here's how you can help:
+We welcome contributions\! Here's how you can help:
 
 ### Getting Started
 
-1. Fork the repository
-2. Create a new branch for your feature/fix: `git checkout -b feature-name`
-3. Install development dependencies: `pip install -e .[dev]`
+1.  Fork the repository
+2.  Create a new branch for your feature/fix: `git checkout -b feature-name`
+3.  Install development dependencies: `pip install -e .[dev]`
 
 ### Guidelines
 
-- **Code Style**: Follow PEP 8 for Python code. For CUDA code, follow the existing style in the codebase
-- **Documentation**: Add docstrings to new functions and update README if needed
-- **Testing**: Add tests for new features and ensure all tests pass
-- **Benchmarking**: If your code changes affect performance, delete the `plots/benchmark_results` and rerun some benchmarks with `python -m perf.benchmark fwd+bwd`
-- **Commits**: Write clear, concise commit messages
-- **Performance**: For CUDA kernels, include benchmarks showing performance impact
+  - **Code Style**: Follow PEP 8 for Python code. For CUDA code, follow the existing style in the codebase
+  - **Documentation**: Add docstrings to new functions and update README if needed
+  - **Testing**: Add tests for new features and ensure all tests pass
+  - **Benchmarking**: If your code changes affect performance, delete the `plots/benchmark_results` and rerun some benchmarks with `python -m perf.benchmark fwd+bwd`
+  - **Commits**: Write clear, concise commit messages
+  - **Performance**: For CUDA kernels, include benchmarks showing performance impact
 
 ### Pull Request Process
 
-1. Update documentation for any new features
-2. Add or update tests as needed
-3. Ensure all tests pass: `pytest`
-4. Run benchmarks if performance-critical code was changed: `python3 -m perf.benchmark fwd+bwd`
-5. Create a Pull Request with a clear description of changes
-6. Wait for review and address any feedback
+1.  Update documentation for any new features
+2.  Add or update tests as needed
+3.  Ensure all tests pass: `pytest`
+4.  Run benchmarks if performance-critical code was changed: `python3 -m perf.benchmark fwd+bwd`
+5.  Create a Pull Request with a clear description of changes
+6.  Wait for review and address any feedback
 
 ### Areas for Contribution
 
-- Performance optimizations for different GPU architectures
-- Documentation improvements
-- Bug fixes
-- Test coverage improvements
+  - Performance optimizations for different GPU architectures
+  - Documentation improvements
+  - Bug fixes
+  - Test coverage improvements
 
 For major changes, please open an issue first to discuss what you would like to change.
 
 ## Release Process
 
-1. Update the version in `pyproject.toml`
-2. Run `pytest` and benchmarks if applicable
-3. Run `make release-test` to build & push to Test PyPI for all Python targets
-4. Run `make release` to build & push to PyPI for all Python targets
+1.  Update the version in `pyproject.toml`
+2.  Run `pytest` and benchmarks if applicable
+3.  Run `make release-test` to build & push to Test PyPI for all Python targets
+4.  Run `make release` to build & push to PyPI for all Python targets
 
 ## Citation
 
 If you use this code in your research, please cite:
 
 ```bibtex
-@article{buckman2024symmetric,
-  title={Symmetric Power Transformers},
-  author={Buckman, Jacob and Gelada, Carles and Zhang, Sean},
-  publisher={Manifest AI},
-  year={2024},
-  month={8},
-  url={https://manifestai.com/articles/symmetric-power-transformers/}
+@article{nejati2025finely,
+  title={Finely Crafted State Spaces for Fast Attention},
+  author={Nejati, Alireza},
+  journal={arXiv preprint arXiv:2508.04239},
+  year={2025}
 }
 ```
 
 ## License
 
-Apache 2.0 (see [LICENSE](LICENSE))
+Apache 2.0 (see [LICENSE](https://www.google.com/search?q=LICENSE))

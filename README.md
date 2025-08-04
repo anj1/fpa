@@ -2,7 +2,7 @@
 
 [](https://github.com/anj1/fpa/actions/workflows/build-and-test.yml)
 
-[cite\_start]This repository contains a PyTorch layer implementing Factorized Polynomial Attention (FPA)[cite: 725, 747]. [cite\_start]FPA is a linear-cost attention mechanism that generalizes Power Attention and offers fine-grained control over its state size[cite: 725, 728]. [cite\_start]The architecture expresses a degree-n polynomial kernel as a product of n inner products in lower-dimensional projected spaces, allowing the state size to be adjusted by tuning the projection dimensions[cite: 726, 727].
+This repository contains a PyTorch layer implementing Factorized Polynomial Attention (FPA). FPA is a linear-cost attention mechanism that generalizes Power Attention and offers fine-grained control over its state size. The architecture expresses a degree-n polynomial kernel as a product of n inner products in lower-dimensional projected spaces, allowing the state size to be adjusted by tuning the projection dimensions.
 
 For details on the approach, see our post: [https://anj1.github.io/research/posts/fpattention/](https://anj1.github.io/research/posts/fpattention/)
 

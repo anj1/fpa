@@ -75,7 +75,6 @@ def fpa_diagonal_attention(Q, K, V, G_diagonals, log_G, n_branches, r=1, w=1, ca
     s = s * scale
 
     m = (_qidx // r) >= (_kidx // w) if causal else torch.ones_like(s, dtype=torch.bool)
-    signs = torch.sign(s)
     
     s = torch.where(m, log(s.abs() + ε), -float("inf"))
     
@@ -84,7 +83,7 @@ def fpa_diagonal_attention(Q, K, V, G_diagonals, log_G, n_branches, r=1, w=1, ca
     
     rowmax = torch.max(s, dim=-1, keepdim=True).values.detach()
     
-    p = exp(s - rowmax).to(V.dtype) * signs
+    p = exp(s - rowmax).to(V.dtype)
     
     l = torch.sum(p, dim=-1).to(torch.float32) + ε
     o = torch.matmul(p, V)

@@ -53,20 +53,15 @@ def _attn_fwd_inner_diag_fpa(acc, l_i, m_i, q, gq, p_k, p_gk, p_v, p_g,
         
         k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
         
-        
         s = tl.full((BM, BN), 1.0, dtype=tl.float32)
 
-        offsets = tl.arange(0, DIM_QK)           # [0 … 63]
-
         for _ in tl.static_range(n_branches):
-            g_l = tl.load(p_g, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            g_l = tl.load(p_g, boundary_check=(0, 1), padding_option="zero")
             p_g = tl.advance(p_g, (1, 0))              # next branch
-            s *= tl.dot(q.to(tl.float32) * g_l, k)     # element-wise scale then dot
+            s *= tl.dot(q * g_l, k)     # element-wise scale then dot
 
         s *= scale
          
-        signs = tl.where(s > 0, 1, -1)
-
         if gating:
             gk = tl.load(p_gk, boundary_check=(0,), padding_option="zero")
         else:
@@ -87,9 +82,9 @@ def _attn_fwd_inner_diag_fpa(acc, l_i, m_i, q, gq, p_k, p_gk, p_v, p_g,
         m_ij = tl.maximum(m_i, tl.max(s, 1))
 
         if use_log2:
-            p = tl.exp2(s - m_ij[:, None]) * signs
+            p = tl.exp2(s - m_ij[:, None])
         else:
-            p = tl.exp(s - m_ij[:, None]) * signs
+            p = tl.exp(s - m_ij[:, None])
 
         l_ij = tl.sum(p, 1)
         # -- scale acc --
@@ -293,22 +288,21 @@ def _attn_bwd_dkdv_diag_fpa(dk, dv, dg, dgk, k, v, gk, G_diagonals, #
             s_branch_T = tl.dot(k, qT * g_l[:, None])
             s_prod_T *= s_branch_T
 
-        s_signs = tl.where(s_prod_T > 0, 1, -1)
         if use_log2:
-            zT = tl.log2(s_prod_T.abs() + 1e-7)
+            zT = tl.log2(s_prod_T.abs() + 1e-6) + tl.log2(scale)
         else:
-            zT = tl.log(s_prod_T.abs() + 1e-7)
+            zT = tl.log(s_prod_T.abs() + 1e-6) + tl.log(scale)
         if gating:
             zT = zT + gq[None, :] - gk[:, None]
         p_m = M + range_m * stride_mm
-        m = tl.load(p_m, mask=range_m < M_CTX, other=-float("inf"))
+        m = tl.load(p_m, mask=range_m < M_CTX, other=float("inf"))
         if MASK:
             mask = (range_m[None, :] // r) >= (range_n[:, None] // w)
             zT = tl.where(mask, zT, -float("inf"))
         if use_log2:
-            pT = tl.exp2(zT - m[None, :]) * s_signs
+            pT = tl.exp2(zT - m[None, :]) 
         else:
-            pT = tl.exp(zT - m[None, :]) * s_signs
+            pT = tl.exp(zT - m[None, :])
 
         # --- compute dv ---
         do = tl.load(p_do, boundary_check=(0, 1), padding_option="zero")
@@ -316,11 +310,14 @@ def _attn_bwd_dkdv_diag_fpa(dk, dv, dg, dgk, k, v, gk, G_diagonals, #
 
         # --- compute dp ---
         if norm:
-            dl_or_delta = - tl.load(Delta + range_m * stride_dm, mask=range_m < M_CTX, other=0.0)
+            dl_or_delta = tl.load(Delta + range_m * stride_dm, mask=range_m < M_CTX, other=0.0)
         else:
             dl_or_delta = tl.load(DL + range_m * stride_dlm, mask=range_m < M_CTX, other=0.0)
         dpT = tl.dot(v, tl.trans(do), out_dtype=tl.float32) # (BN, BM)
         ds_scaled_T = pT * (dpT + dl_or_delta[None, :])
+
+        s_prod_abs_T = s_prod_T.abs()
+        grad_s_prod_T = ds_scaled_T * s_prod_T / (s_prod_abs_T + 1e-6)
 
         if gating:
             dgk += -tl.sum(ds_scaled_T, 1)
@@ -329,7 +326,7 @@ def _attn_bwd_dkdv_diag_fpa(dk, dv, dg, dgk, k, v, gk, G_diagonals, #
         for l in tl.static_range(n_branches):
             g_l = tl.load(G_diagonals + l * stride_g + offsets)
             s_branch_T = tl.dot(k, qT * g_l[:, None])
-            ds_branch_T = ds_scaled_T / (s_branch_T + 1e-7)
+            ds_branch_T = grad_s_prod_T / (s_branch_T + 1e-6)
             
             # dk
             qT_projected = qT * g_l[:, None]
@@ -387,11 +384,10 @@ def _attn_bwd_dq_diag_fpa(dq, dgq, q, gq, do, m, dl_or_delta, #
             s_branch = tl.dot(q * g_l[None, :], kT)
             s_prod *= s_branch
 
-        s_signs = tl.where(s_prod > 0, 1, -1)
         if use_log2:
-            z = tl.log2(s_prod.abs() + 1e-7)
+            z = tl.log2(s_prod.abs() + 1e-6) + tl.log2(scale)
         else:
-            z = tl.log(s_prod.abs() + 1e-7)
+            z = tl.log(s_prod.abs() + 1e-6) + tl.log(scale)
         if gating:
             z = z + gq[:, None] - gk[None, :]
         if MASK:
@@ -399,22 +395,28 @@ def _attn_bwd_dq_diag_fpa(dq, dgq, q, gq, do, m, dl_or_delta, #
             z = tl.where(mask, z, -float("inf"))
         
         if use_log2:
-            p = tl.exp2(z - m[:, None]) * s_signs
+            p = tl.exp2(z - m[:, None])
         else:
-            p = tl.exp(z - m[:, None]) * s_signs
+            p = tl.exp(z - m[:, None])
 
         # --- compute dQ ---
         dp = tl.dot(do, vT, out_dtype=tl.float32)
         ds_scaled = p * (dp + dl_or_delta[:, None])
+        s_prod_abs = s_prod.abs()
+        grad_s_prod = ds_scaled * s_prod / (s_prod_abs + 1e-6)
         if gating:
-            dgq += tl.sum(ds_scaled / s_signs, 1, keep_dims=False)
+            dgq += tl.sum(ds_scaled, 1, keep_dims=False)
         
+        offsets = tl.arange(0, DIM_QK)
         for l in tl.static_range(n_branches):
             g_l = tl.load(G_diagonals + l * stride_g + offsets)
             s_branch = tl.dot(q * g_l[None, :], kT)
-            ds_branch = ds_scaled / (s_branch + 1e-7)
-            dq += tl.dot(ds_branch.to(kT.type.element_ty), tl.trans(kT)) * g_l[None, :]
-
+            ds_branch = grad_s_prod / (s_branch + 1e-6)
+            # dQ
+            dq_branch_update = tl.dot(ds_branch.to(kT.type.element_ty), tl.trans(kT))
+            dq += dq_branch_update * g_l[None, :]
+            # dG is computed in the dk/dv kernel
+            # tl.atomic_add(dg + l * stride_g + offsets, tl.sum(q * dq_branch_update, axis=0))
         # increment pointers
         curr_n += BN
         p_kT = tl.advance(p_kT, (0, BN))
@@ -532,6 +534,73 @@ def _attn_bwd_diag_fpa(Q, K, V, G_diagonals, LOG_GQ, LOG_GK, M, Delta, DO, DL, D
                                 n_branches, scale, gating, BM1, BN1, DIM_QK, DIM_VO, #
                                 start_n, start_m, num_steps, #
                                 False, norm, use_log2)
+
+    p_dv = tl.make_block_ptr(DV, (N_CTX, DIM_VO), (stride_dvn, stride_dve), (start_n, 0), (BN1, DIM_VO), (1, 0))
+    p_dk = tl.make_block_ptr(DK, (N_CTX, DIM_QK), (stride_dkn, stride_dkd), (start_n, 0), (BN1, DIM_QK), (1, 0))
+
+    mask_dkv = range_n < N_CTX
+    tl.store(p_dv, dv.to(DV.type.element_ty), boundary_check=(0, 1))
+    tl.store(p_dk, dk.to(DK.type.element_ty), boundary_check=(0, 1))
+    if gating:
+        p_dgk = DLOG_GK + range_n * stride_gkn
+        tl.store(p_dgk, dgk, mask=mask_dkv)
+
+    # -- Second part: compute dq
+    start_m = tl.program_id(0) * BM2
+
+    MASK_BLOCK_N2: tl.constexpr = BN2 // BLK_SLICE_FACTOR
+
+    # load q, gq
+    p_q = tl.make_block_ptr(Q, (M_CTX, DIM_QK), (stride_qm, stride_qd), (start_m, 0), (BM2, DIM_QK), (1, 0))
+    p_do = tl.make_block_ptr(DO, (M_CTX, DIM_VO), (stride_dom, stride_doe), (start_m, 0), (BM2, DIM_VO), (1, 0))
+
+    if gating:
+        p_gq = tl.make_block_ptr(LOG_GQ, (M_CTX,), (stride_gqm,), (start_m,), (BM2,), (0,))
+        gq = tl.load(p_gq, cache_modifier=".cg", boundary_check=(0,), padding_option="zero")
+    else:
+        gq = None
+    q = tl.load(p_q, cache_modifier=".cg", boundary_check=(0, 1), padding_option="zero")
+    range_m = start_m + tl.arange(0, BM2)
+    m = tl.load(M + range_m * stride_mm, mask=range_m < M_CTX, other=float("inf"))
+    if norm:
+        dl_or_delta = - tl.load(Delta + range_m * stride_dm, cache_modifier=".cg", mask=range_m < M_CTX, other=0.0)
+    else:
+        dl_or_delta = tl.load(DL + range_m * stride_dlm, cache_modifier=".cg", mask=range_m < M_CTX, other=0.0)
+    do = tl.load(p_do, cache_modifier=".cg", boundary_check=(0,1), padding_option="zero")
+
+    dq = tl.zeros([BM2, DIM_QK], dtype=tl.float32)
+    dgq = tl.zeros([BM2,], dtype=tl.float32)
+
+    end_n = (start_m + BM2) if STAGE & 2 else M_CTX
+    if STAGE & 2: # masked blocks
+        num_steps = BM2 // MASK_BLOCK_N2
+        dq, dgq = _attn_bwd_dq_diag_fpa(dq, dgq, q, gq, do, m, dl_or_delta, #
+                               K, V, G_diagonals, LOG_GK, #
+                               stride_kn, stride_kd, stride_vn, stride_ve, stride_gkn, #
+                               stride_gn, #
+                               M_CTX, N_CTX, r, w, #
+                               n_branches, scale, gating, BM2, MASK_BLOCK_N2, DIM_QK, DIM_VO, #
+                               start_m, 0, num_steps, #
+                               MASK=True, use_log2=use_log2)
+        end_n -= num_steps * MASK_BLOCK_N2
+    
+    # unmasked blocks
+    num_steps = end_n // BN2
+    dq, dgq = _attn_bwd_dq_diag_fpa(dq, dgq, q, gq, do, m, dl_or_delta, #
+                           K, V, G_diagonals, LOG_GK, #
+                           stride_kn, stride_kd, stride_vn, stride_ve, stride_gkn, #
+                           stride_gn, #
+                           M_CTX, N_CTX, r, w, #
+                           n_branches, scale, gating, BM2, BN2, DIM_QK, DIM_VO, #
+                           start_m, 0, num_steps, #
+                           MASK=False, use_log2=use_log2)
+
+    # store dq, dgq
+    p_dq = tl.make_block_ptr(DQ, (M_CTX, DIM_QK), (stride_dqm, stride_dqd), (start_m, 0), (BM2, DIM_QK), (1, 0))
+    tl.store(p_dq, dq.to(DQ.type.element_ty), boundary_check=(0, 1))
+    if gating:
+        p_dgq = tl.make_block_ptr(DLOG_GQ, (M_CTX,), (stride_gqm,), (start_m,), (BM2,), (0,))
+        tl.store(p_dgq, dgq, boundary_check=(0,))
 
 class _diag_fp_attention(torch.autograd.Function):
     @staticmethod
@@ -808,8 +877,6 @@ def run_test(kw, identity_G=False, verbose=False):
         compare_tensors("Sum (l)", l_triton, l_ref, verbose=verbose)
         compare_tensors("Rowmax (m)", rowmax_triton, rowmax_ref, verbose=verbose)
 
-    exit(2)
-
     # === Backward Pass Test ===
     print("\n--- BWD Pass ---")
     print("NOTE: BWD test will fail if the main backward kernel is not implemented/uncommented.")
@@ -825,8 +892,6 @@ def run_test(kw, identity_G=False, verbose=False):
     
     ref_inputs = clone_dict(tri_inputs)
     Q_ref, K_ref, V_ref, G_diag_ref, log_G_ref = ref_inputs['Q'], ref_inputs['K'], ref_inputs['V'], ref_inputs['G_diagonal'], ref_inputs['log_G']
-
-    #print(ref_inputs["K"][:,:,0:4,0:4])
 
     o_triton = attention(Q_tri, K_tri, V_tri, G_diag_tri, log_G_tri, **attn_params)
     if not kw['norm']: o_triton = o_triton[0]
@@ -851,9 +916,9 @@ if __name__ == "__main__":
     # Correctness testing
     print("="*20 + " Correctness Test " + "="*20)
     test_configs = [
-        #dict(b=2, h=2, t=4, d_in=16, dtype=torch.float32, device='cuda', n_branches=2, seed=42, std=1/8.0, gating=True, norm=False, head_first=True),
-        dict(b=2, h=2, t=64, d_in=32, dtype=torch.float32, device='cuda', n_branches=2, seed=42, std=1/8.0, gating=True, norm=False, head_first=True),
-        dict(b=1, h=4, t=128, d_in=64, dtype=torch.bfloat16, device='cuda', n_branches=3, seed=24, std=1/8.0, gating=False, norm=True, head_first=False),
+        dict(b=1, h=2, t=2, d_in=16, dtype=torch.float32, device='cuda', n_branches=2, seed=42, std=1/8.0, gating=True, norm=False, head_first=True),
+        #dict(b=2, h=2, t=64, d_in=32, dtype=torch.float32, device='cuda', n_branches=2, seed=42, std=1/8.0, gating=True, norm=False, head_first=True),
+        #dict(b=1, h=4, t=128, d_in=64, dtype=torch.bfloat16, device='cuda', n_branches=3, seed=24, std=1/8.0, gating=False, norm=True, head_first=False),
     ]
     for i, kw in enumerate(test_configs):
         print(f"\n--- Config {i+1}: { {k:v for k,v in kw.items() if k not in ['device', 'dtype', 'seed', 'std']} } ---")

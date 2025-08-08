@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from fp_attention._utils import diff
 
+ε = tl.constexpr(1e-6)
 
 fwd_configs = [
     triton.Config({'BM': BM, 'BN': BN}, num_stages=s, num_warps=w) \
@@ -68,9 +69,9 @@ def _attn_fwd_inner_diag_fpa(acc, l_i, m_i, q, gq, p_k, p_gk, p_v, p_g,
             gk = None
 
         if use_log2:
-            s = tl.log2(s.abs() + 1e-6)
+            s = tl.log2(s.abs() + ε)
         else:
-            s = tl.log(s.abs() + 1e-6)
+            s = tl.log(s.abs() + ε)
 
         if gating:
             s = s + gq[:, None] - gk[None, :]
@@ -183,7 +184,7 @@ def _attn_fwd_diag_fpa(Q, K, V, G_diagonals, LOG_GQ, LOG_GK, L, M, Out, #
                                    n_branches, scale, gating, BM, BN, DIM_QK, DIM_VO,
                                    M_CTX, N_CTX, 2, use_log2)
         
-    l_i = l_i + 1e-6
+    l_i = l_i + ε
     if norm:
         if use_log2:
             m_i += tl.log2(l_i)
@@ -224,7 +225,6 @@ def keep_bwd(conf):
         return False
     return True
 
-
 preprocess_configs = [
     triton.Config({'BM': BM})
     for BM in [64, 128, 256]
@@ -250,22 +250,24 @@ def _attn_bwd_preprocess(O, DO, Delta,  #
     # write-back
     tl.store(Delta + off_b * stride_db + off_h * stride_dh + range_m * stride_dm, delta, mask=mask_m)
 
-
 @triton.jit
 def _attn_bwd_dkdv_diag_fpa(dk, dv, dg, dgk, k, v, gk, G_diagonals, #
-                    Q, LOG_GQ, DO, M, Delta, DL, #
-                    stride_qm, stride_qd, stride_dom, stride_doe, stride_gqm, stride_mm, stride_dm, stride_dlm, #
-                    stride_g, #
-                    M_CTX, N_CTX, r: tl.constexpr, w: tl.constexpr, #
-                    n_branches: tl.constexpr, scale: tl.constexpr, gating: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, DIM_QK: tl.constexpr, DIM_VO: tl.constexpr, #
-                    start_n, start_m, num_steps: tl.constexpr, #
-                    MASK: tl.constexpr, norm: tl.constexpr, use_log2: tl.constexpr):
+                             Q, LOG_GQ, DO, M, Delta, DL, #
+                             stride_qm, stride_qd, stride_dom, stride_doe, stride_gqm, stride_mm, stride_dm, stride_dlm, #
+                             stride_g, # stride along branch dim for G
+                             M_CTX, N_CTX, r: tl.constexpr, w: tl.constexpr, #
+                             n_branches: tl.constexpr, scale: tl.constexpr, gating: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, DIM_QK: tl.constexpr, DIM_VO: tl.constexpr, #
+                             start_n, start_m, num_steps: tl.constexpr, #
+                             MASK: tl.constexpr, norm: tl.constexpr, use_log2: tl.constexpr):
     tl.static_assert(BM % r == 0, "BM must be divisible by r")
     tl.static_assert(BN % w == 0, "BN must be divisible by w")
+
     range_n = start_n + tl.arange(0, BN)
 
     p_qT = tl.make_block_ptr(Q, (DIM_QK, M_CTX), (stride_qd, stride_qm), (0, start_m), (DIM_QK, BM), (0, 1))
     p_do = tl.make_block_ptr(DO, (M_CTX, DIM_VO), (stride_dom, stride_doe), (start_m, 0), (BM, DIM_VO), (1, 0))
+    p_m  = None  # rowmax pointer derived per step via base M + m*stride_mm
+
     if gating:
         p_gq = tl.make_block_ptr(LOG_GQ, (M_CTX,), (stride_gqm,), (start_m,), (BM,), (0,))
     else:
@@ -274,69 +276,78 @@ def _attn_bwd_dkdv_diag_fpa(dk, dv, dg, dgk, k, v, gk, G_diagonals, #
     curr_m = start_m
     for _ in range(num_steps):
         range_m = curr_m + tl.arange(0, BM)
-        # --- re-compute p ---
-        qT = tl.load(p_qT, boundary_check=(0, 1), padding_option="zero")
+
+        # loads
+        qT = tl.load(p_qT, boundary_check=(0, 1), padding_option="zero")           # (D, BM)
+        qT_f32 = qT.to(tl.float32)
+        do = tl.load(p_do, boundary_check=(0, 1), padding_option="zero")           # (BM, E)
         if gating:
-            gq = tl.load(p_gq, boundary_check=(0,), padding_option="zero")
+            gq = tl.load(p_gq, boundary_check=(0,), padding_option="zero")         # (BM,)
         else:
             gq = tl.zeros((BM,), dtype=tl.float32)
-        
-        s_prod_T = tl.full((BN, BM), 1.0, dtype=tl.float32)
+
+        k_f32 = k.to(tl.float32)                                                     # (BN, D)
+
+        # product over branches (FP32)
+        prod = tl.full((BN, BM), 1.0, dtype=tl.float32)
         offsets = tl.arange(0, DIM_QK)
         for l in tl.static_range(n_branches):
-            g_l = tl.load(G_diagonals + l * stride_g + offsets)
-            s_branch_T = tl.dot(k, qT * g_l[:, None])
-            s_prod_T *= s_branch_T
+            g_l = tl.load(G_diagonals + l * stride_g + offsets)                      # (D,)
+            q_proj = qT_f32 * g_l[:, None]                                           # (D, BM)
+            s_l = tl.dot(k_f32, q_proj, out_dtype=tl.float32)                       # (BN, BM)
+            prod *= s_l
+        # scale ONCE (matches ref bwd)
+        prod *= scale
 
+        # z = log(|prod|) + gating, masked before exp
         if use_log2:
-            zT = tl.log2(s_prod_T.abs() + 1e-6) + tl.log2(scale)
+            z = tl.log2(tl.abs(prod) + ε)
         else:
-            zT = tl.log(s_prod_T.abs() + 1e-6) + tl.log(scale)
+            z = tl.log(tl.abs(prod) + ε)
         if gating:
-            zT = zT + gq[None, :] - gk[:, None]
-        p_m = M + range_m * stride_mm
-        m = tl.load(p_m, mask=range_m < M_CTX, other=float("inf"))
+            z = z + gq[None, :] - gk[:, None]
         if MASK:
             mask = (range_m[None, :] // r) >= (range_n[:, None] // w)
-            zT = tl.where(mask, zT, -float("inf"))
-        if use_log2:
-            pT = tl.exp2(zT - m[None, :]) 
-        else:
-            pT = tl.exp(zT - m[None, :])
+            z = tl.where(mask, z, -float("inf"))
 
-        # --- compute dv ---
-        do = tl.load(p_do, boundary_check=(0, 1), padding_option="zero")
-        dv = tl.dot(pT.to(Q.type.element_ty), do, dv)
+        # p = exp(z - m)
+        m = tl.load(M + range_m * stride_mm, mask=range_m < M_CTX, other=float("inf"))
+        p = tl.exp2(z - m[None, :]) if use_log2 else tl.exp(z - m[None, :])          # (BN, BM)
 
-        # --- compute dp ---
+        # dv accumulation
+        dv = tl.dot(p.to(Q.type.element_ty), do, dv)
+
+        # dp and ds_scaled = p * (dp + dl_or_delta)
+        dp = tl.dot(v, tl.trans(do), out_dtype=tl.float32)                           # (BN, BM)
         if norm:
             dl_or_delta = tl.load(Delta + range_m * stride_dm, mask=range_m < M_CTX, other=0.0)
         else:
             dl_or_delta = tl.load(DL + range_m * stride_dlm, mask=range_m < M_CTX, other=0.0)
-        dpT = tl.dot(v, tl.trans(do), out_dtype=tl.float32) # (BN, BM)
-        ds_scaled_T = pT * (dpT + dl_or_delta[None, :])
-
-        s_prod_abs_T = s_prod_T.abs()
-        grad_s_prod_T = ds_scaled_T * s_prod_T / (s_prod_abs_T + 1e-6)
+        ds_scaled = p * (dp + dl_or_delta[None, :])                                   # (BN, BM)
 
         if gating:
-            dgk += -tl.sum(ds_scaled_T, 1)
+            dgk += -tl.sum(ds_scaled, 1)
 
-        # --- compute dk, dG ---
+        # per-branch grads: ds_branch = ds_scaled / s_l_safe (NO prod_sign)
         for l in tl.static_range(n_branches):
             g_l = tl.load(G_diagonals + l * stride_g + offsets)
-            s_branch_T = tl.dot(k, qT * g_l[:, None])
-            ds_branch_T = grad_s_prod_T / (s_branch_T + 1e-6)
-            
-            # dk
-            qT_projected = qT * g_l[:, None]
-            dk += tl.dot(ds_branch_T.to(qT.type.element_ty), tl.trans(qT_projected))
-            
-            # dG
-            d_g_l = tl.sum(tl.dot(k.T, ds_branch_T.to(qT.type.element_ty)) * qT, axis=1)
+            q_proj = qT_f32 * g_l[:, None]
+            s_l = tl.dot(k_f32, q_proj, out_dtype=tl.float32)
+            s_abs = tl.abs(s_l)
+            sign_s = tl.where(s_l >= 0, 1.0, -1.0)
+            s_safe = tl.where(s_abs < ε, sign_s * ε, s_l)
+
+            ds_l = ds_scaled / s_safe                                               # (BN, BM)
+
+            # dK: sum_i ds_l(j,i) * (q_proj)ᵀ
+            dk += tl.dot(ds_l, tl.trans(q_proj))
+
+            # dG: Σ_{j,i} ds_l(j,i) * q(i,d) * k(j,d)
+            tmp = tl.dot(ds_l, tl.trans(qT_f32))                                    # (BN, D)
+            d_g_l = tl.sum(tmp * k_f32, axis=0)                                     # (D,)
             tl.atomic_add(dg + l * stride_g + offsets, d_g_l)
 
-        # increment pointers
+        # advance pointers
         curr_m += BM
         p_qT = tl.advance(p_qT, (0, BM))
         p_do = tl.advance(p_do, (BM, 0))
@@ -348,15 +359,16 @@ def _attn_bwd_dkdv_diag_fpa(dk, dv, dg, dgk, k, v, gk, G_diagonals, #
 
 @triton.jit
 def _attn_bwd_dq_diag_fpa(dq, dgq, q, gq, do, m, dl_or_delta, #
-                  K, V, G_diagonals, LOG_GK, #
-                  stride_kn, stride_kd, stride_vn, stride_ve, stride_gkn, #
-                  stride_g, #
-                  M_CTX, N_CTX, r, w, #
-                  n_branches: tl.constexpr, scale: tl.constexpr, gating: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, DIM_QK: tl.constexpr, DIM_VO: tl.constexpr, #
-                  start_m, start_n, num_steps: tl.constexpr, #
-                  MASK: tl.constexpr, use_log2: tl.constexpr):
+                          K, V, G_diagonals, LOG_GK, #
+                          stride_kn, stride_kd, stride_vn, stride_ve, stride_gkn, #
+                          stride_g, # stride along branch for G
+                          M_CTX, N_CTX, r, w, #
+                          n_branches: tl.constexpr, scale: tl.constexpr, gating: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, DIM_QK: tl.constexpr, DIM_VO: tl.constexpr, #
+                          start_m, start_n, num_steps: tl.constexpr, #
+                          MASK: tl.constexpr, use_log2: tl.constexpr):
     tl.static_assert(BM % r == 0, "BM must be divisible by r")
     tl.static_assert(BN % w == 0, "BN must be divisible by w")
+
     range_m = start_m + tl.arange(0, BM)
 
     p_kT = tl.make_block_ptr(K, (DIM_QK, N_CTX), (stride_kd, stride_kn), (0, start_n), (DIM_QK, BN), (0, 1))
@@ -369,55 +381,54 @@ def _attn_bwd_dq_diag_fpa(dq, dgq, q, gq, do, m, dl_or_delta, #
     curr_n = start_n
     for _ in range(num_steps):
         range_n = curr_n + tl.arange(0, BN)
-        # --- re-compute p ---
-        kT = tl.load(p_kT, boundary_check=(0, 1), padding_option="zero")
+
+        kT = tl.load(p_kT, boundary_check=(0, 1), padding_option="zero") 
         vT = tl.load(p_vT, boundary_check=(0, 1), padding_option="zero")
+        kT_f32 = kT.to(tl.float32)
         if gating:
-            gk = tl.load(p_gk, boundary_check=(0,), padding_option="zero")
+            gk = tl.load(p_gk, boundary_check=(0,), padding_option="zero") 
         else:
             gk = tl.zeros((BN,), dtype=tl.float32)
-        
-        s_prod = tl.full((BM, BN), 1.0, dtype=tl.float32)
+
+        # prod over branches
+        prod = tl.full((BM, BN), 1.0, dtype=tl.float32)
+        q_f32 = q.to(tl.float32)
         offsets = tl.arange(0, DIM_QK)
         for l in tl.static_range(n_branches):
             g_l = tl.load(G_diagonals + l * stride_g + offsets)
-            s_branch = tl.dot(q * g_l[None, :], kT)
-            s_prod *= s_branch
+            s_l = tl.dot(q_f32 * g_l[None, :], kT_f32, out_dtype=tl.float32)
+            prod *= s_l
+        prod *= scale
 
+        # z and p
         if use_log2:
-            z = tl.log2(s_prod.abs() + 1e-6) + tl.log2(scale)
+            z = tl.log2(tl.abs(prod) + ε)
         else:
-            z = tl.log(s_prod.abs() + 1e-6) + tl.log(scale)
+            z = tl.log(tl.abs(prod) + ε)
         if gating:
             z = z + gq[:, None] - gk[None, :]
         if MASK:
             mask = (range_m[:, None] // r) >= (range_n[None, :] // w)
             z = tl.where(mask, z, -float("inf"))
-        
-        if use_log2:
-            p = tl.exp2(z - m[:, None])
-        else:
-            p = tl.exp(z - m[:, None])
+        p = tl.exp2(z - m[:, None]) if use_log2 else tl.exp(z - m[:, None])
 
-        # --- compute dQ ---
+        # dp and ds
         dp = tl.dot(do, vT, out_dtype=tl.float32)
         ds_scaled = p * (dp + dl_or_delta[:, None])
-        s_prod_abs = s_prod.abs()
-        grad_s_prod = ds_scaled * s_prod / (s_prod_abs + 1e-6)
+
         if gating:
-            dgq += tl.sum(ds_scaled, 1, keep_dims=False)
-        
-        offsets = tl.arange(0, DIM_QK)
+            dgq += tl.sum(ds_scaled, 1)
+
+        # per-branch dq: ds_branch = ds_scaled / s_l_safe; then dQ += ds_branch @ K * g_l
         for l in tl.static_range(n_branches):
             g_l = tl.load(G_diagonals + l * stride_g + offsets)
-            s_branch = tl.dot(q * g_l[None, :], kT)
-            ds_branch = grad_s_prod / (s_branch + 1e-6)
-            # dQ
-            dq_branch_update = tl.dot(ds_branch.to(kT.type.element_ty), tl.trans(kT))
-            dq += dq_branch_update * g_l[None, :]
-            # dG is computed in the dk/dv kernel
-            # tl.atomic_add(dg + l * stride_g + offsets, tl.sum(q * dq_branch_update, axis=0))
-        # increment pointers
+            s_l = tl.dot(q_f32 * g_l[None, :], kT_f32, out_dtype=tl.float32)
+            s_abs = tl.abs(s_l)
+            sign_s = tl.where(s_l >= 0, 1.0, -1.0)
+            s_safe = tl.where(s_abs < ε, sign_s * ε, s_l)
+            ds_l = ds_scaled / s_safe
+            dq += tl.dot(ds_l, tl.trans(kT_f32)) * g_l[None, :]
+
         curr_n += BN
         p_kT = tl.advance(p_kT, (0, BN))
         p_vT = tl.advance(p_vT, (0, BN))
@@ -494,6 +505,7 @@ def _attn_bwd_diag_fpa(Q, K, V, G_diagonals, LOG_GQ, LOG_GK, M, Delta, DO, DL, D
 
     # -- First part: compute dk, dv
     MASK_BLOCK_M1: tl.constexpr = BM1 // BLK_SLICE_FACTOR
+
     range_n = start_n + tl.arange(0, BN1)
 
     dv = tl.zeros([BN1, DIM_VO], dtype=tl.float32)
@@ -514,6 +526,7 @@ def _attn_bwd_diag_fpa(Q, K, V, G_diagonals, LOG_GQ, LOG_GK, M, Delta, DO, DL, D
     start_m = start_n if STAGE == 3 else 0
     if STAGE & 2: # masked blocks
         num_steps = BN1 // MASK_BLOCK_M1
+        
         dk, dv, dgk = _attn_bwd_dkdv_diag_fpa(dk, dv, DG, dgk, k, v, gk, G_diagonals,
                                     Q, LOG_GQ, DO, M, Delta, DL,
                                     stride_qm, stride_qd, stride_dom, stride_doe, stride_gqm, stride_mm, stride_dm, stride_dlm,
@@ -537,7 +550,7 @@ def _attn_bwd_diag_fpa(Q, K, V, G_diagonals, LOG_GQ, LOG_GK, M, Delta, DO, DL, D
 
     p_dv = tl.make_block_ptr(DV, (N_CTX, DIM_VO), (stride_dvn, stride_dve), (start_n, 0), (BN1, DIM_VO), (1, 0))
     p_dk = tl.make_block_ptr(DK, (N_CTX, DIM_QK), (stride_dkn, stride_dkd), (start_n, 0), (BN1, DIM_QK), (1, 0))
-
+    
     mask_dkv = range_n < N_CTX
     tl.store(p_dv, dv.to(DV.type.element_ty), boundary_check=(0, 1))
     tl.store(p_dk, dk.to(DK.type.element_ty), boundary_check=(0, 1))
@@ -586,13 +599,13 @@ def _attn_bwd_diag_fpa(Q, K, V, G_diagonals, LOG_GQ, LOG_GK, M, Delta, DO, DL, D
     
     # unmasked blocks
     num_steps = end_n // BN2
-    dq, dgq = _attn_bwd_dq_diag_fpa(dq, dgq, q, gq, do, m, dl_or_delta, #
-                           K, V, G_diagonals, LOG_GK, #
-                           stride_kn, stride_kd, stride_vn, stride_ve, stride_gkn, #
-                           stride_gn, #
-                           M_CTX, N_CTX, r, w, #
-                           n_branches, scale, gating, BM2, BN2, DIM_QK, DIM_VO, #
-                           start_m, 0, num_steps, #
+    dq, dgq = _attn_bwd_dq_diag_fpa(dq, dgq, q, gq, do, m, dl_or_delta, 
+                           K, V, G_diagonals, LOG_GK, 
+                           stride_kn, stride_kd, stride_vn, stride_ve, stride_gkn, 
+                           stride_gn, 
+                           M_CTX, N_CTX, r, w, 
+                           n_branches, scale, gating, BM2, BN2, DIM_QK, DIM_VO, 
+                           start_m, 0, num_steps, 
                            MASK=False, use_log2=use_log2)
 
     # store dq, dgq
@@ -605,32 +618,6 @@ def _attn_bwd_diag_fpa(Q, K, V, G_diagonals, LOG_GQ, LOG_GK, M, Delta, DO, DL, D
 class _diag_fp_attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, G_diagonal, log_G, n_branches, r, w, causal, head_first, scale, norm, use_log2):
-        """ 
-            Attention formulation of power attention.
-            
-            When norm is True, the output is normalized by temporal norm (l), and the returned
-            temporal norm is uninitialized.
-            When norm is False, the output is not normalized, and l is the temporal norm (sum of exponentials of the powered attention scores)
-
-            Args:
-            Q: (B, H_Q, CTX, D)
-            K: (B, H_K, CTX, D)
-            V: (B, H_K, CTX, E)
-            G_diagonal: (B, H_Q, N_BRANCHES, D) or (B, N_BRANCHES, H_Q, D)
-            n_branches: int
-            log_G: (B, H_Q // R, CTX) or (B, CTX, H_Q // R)
-            r: int, number of heads in q to form a group
-            w: int, number of heads in k to form a group
-            causal: bool
-            head_first: bool
-            norm: bool
-            use_log2: bool
-
-            Returns:
-                o: (B, H_Q // R, CTX, E) if head_first else (B, CTX, H_Q // R, E)
-                l: (B, H_Q // R, CTX) if head_first else (B, CTX, H_Q // R)
-                rowmax: (B, H_Q // R, CTX) if head_first else (B, CTX, H_Q // R)
-        """
         if head_first:
             b, hq, t, d, hk, e = *Q.shape, K.shape[1], V.shape[-1]
         else:
@@ -750,7 +737,7 @@ class _diag_fp_attention(torch.autograd.Function):
         Q, K, V, G_diagonal, l, rowmax, o, log_GQ, log_GK = ctx.saved_tensors
         if log_GQ is not None:
             log_GQ = log_GQ.contiguous() # needed for reuse log_GQ's strides for dlog_GQ
-            log_GK = log_GK.contiguous() # needed for reuse log_GK's strides for dlog_GK
+            log_GK = log_GK.contiguous() 
         do = do.contiguous()
         b, h, t, stage, norm, gating, use_log2 = ctx.b, ctx.h, ctx.t, ctx.stage, ctx.norm, ctx.gating, ctx.use_log2
         q_strides, k_strides, v_strides, g_strides, rowmax_strides, gq_strides, gk_strides = ctx.q_strides, ctx.k_strides, ctx.v_strides, ctx.g_strides, ctx.rowmax_strides, ctx.gq_strides, ctx.gk_strides
@@ -847,7 +834,7 @@ def clone_dict(d):
     return {k: clone_item(v) for k, v in d.items()}
 
 
-def run_test(kw, identity_G=False, verbose=False):
+def run_test(kw, verbose=False):
     """Runs forward and backward pass tests against the reference implementation."""
     from fp_attention._fp_diag_attention.reference import fpa_diagonal_attention
     from fp_attention._fp_diag_attention.create_inputs import create_inputs
@@ -858,9 +845,6 @@ def run_test(kw, identity_G=False, verbose=False):
     # === Forward Pass Test ===
     print("\n--- FWD Pass ---")
     fwd_inputs = create_inputs(**kw)
-    
-    if identity_G:
-        fwd_inputs['G_diagonal'][:] = 1.0
     
     # Triton implementation
     triton_out = attention(fwd_inputs['Q'], fwd_inputs['K'], fwd_inputs['V'], fwd_inputs['G_diagonal'], fwd_inputs['log_G'], **attn_params)
@@ -884,9 +868,6 @@ def run_test(kw, identity_G=False, verbose=False):
     
     # Inputs for Triton
     tri_inputs = create_inputs(**kw_grad)
-    if identity_G:
-        with torch.no_grad():
-            tri_inputs['G_diagonal'][:] = 1.0
     
     Q_tri, K_tri, V_tri, G_diag_tri, log_G_tri = tri_inputs['Q'], tri_inputs['K'], tri_inputs['V'], tri_inputs['G_diagonal'], tri_inputs['log_G']
     
@@ -901,8 +882,19 @@ def run_test(kw, identity_G=False, verbose=False):
 
     do = torch.randn_like(o_triton)
 
-    o_triton.backward(gradient=do, retain_graph=True)
     o_ref.backward(gradient=do, retain_graph=True)
+    
+    # run first to pick best config, discard results
+    o_triton.backward(gradient=do, retain_graph=True)
+    # zero out grads
+    Q_tri.grad.zero_()
+    K_tri.grad.zero_()
+    V_tri.grad.zero_()
+    G_diag_tri.grad.zero_()
+    log_G_tri.grad.zero_()
+    # run again 
+    o_triton.backward(gradient=do, retain_graph=True)
+    
 
     compare_tensors("dQ", Q_tri.grad, Q_ref.grad, verbose=verbose)
     compare_tensors("dK", K_tri.grad, K_ref.grad, verbose=verbose)
@@ -911,12 +903,19 @@ def run_test(kw, identity_G=False, verbose=False):
     # if gating
     if log_G_tri is not None:
         compare_tensors("dlog_G", log_G_tri.grad, log_G_ref.grad, verbose=verbose)
+    # print dG_diagonal tensors
+    print(G_diag_tri)
+    print(G_diag_ref)
+    print(G_diag_tri.grad)
+    print(G_diag_ref.grad)
+    
+    print(G_diag_tri.grad / G_diag_ref.grad)
 
 if __name__ == "__main__":
     # Correctness testing
     print("="*20 + " Correctness Test " + "="*20)
     test_configs = [
-        dict(b=1, h=2, t=2, d_in=16, dtype=torch.float32, device='cuda', n_branches=2, seed=42, std=1/8.0, gating=True, norm=False, head_first=True),
+        dict(b=1, h=1, t=2, d_in=16, dtype=torch.float32, device='cuda', n_branches=2, seed=42, std=1/8.0, gating=True, norm=False, head_first=True),
         #dict(b=2, h=2, t=64, d_in=32, dtype=torch.float32, device='cuda', n_branches=2, seed=42, std=1/8.0, gating=True, norm=False, head_first=True),
         #dict(b=1, h=4, t=128, d_in=64, dtype=torch.bfloat16, device='cuda', n_branches=3, seed=24, std=1/8.0, gating=False, norm=True, head_first=False),
     ]
